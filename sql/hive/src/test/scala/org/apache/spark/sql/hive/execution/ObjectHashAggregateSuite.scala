@@ -43,11 +43,16 @@ class ObjectHashAggregateSuite
   import testImplicits._
 
   protected override def beforeAll(): Unit = {
+    super.beforeAll()
     sql(s"CREATE TEMPORARY FUNCTION hive_max AS '${classOf[GenericUDAFMax].getName}'")
   }
 
   protected override def afterAll(): Unit = {
-    sql(s"DROP TEMPORARY FUNCTION IF EXISTS hive_max")
+    try {
+      sql(s"DROP TEMPORARY FUNCTION IF EXISTS hive_max")
+    } finally {
+      super.afterAll()
+    }
   }
 
   test("typed_count without grouping keys") {

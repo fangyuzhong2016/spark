@@ -26,6 +26,7 @@ import org.apache.spark.sql.{QueryTest, _}
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.InsertIntoTable
 import org.apache.spark.sql.hive.test.TestHiveSingleton
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
@@ -726,6 +727,51 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
       }.getMessage
 
       assert(e.contains("mismatched input 'ROW'"))
+    }
+  }
+
+  test("SPARK-21165: FileFormatWriter should only rely on attributes from analyzed plan") {
+    withSQLConf(("hive.exec.dynamic.partition.mode", "nonstrict")) {
+      withTable("tab1", "tab2") {
+        Seq(("a", "b", 3)).toDF("word", "first", "length").write.saveAsTable("tab1")
+
+        spark.sql(
+          """
+            |CREATE TABLE tab2 (word string, length int)
+            |PARTITIONED BY (first string)
+          """.stripMargin)
+
+        spark.sql(
+          """
+            |INSERT INTO TABLE tab2 PARTITION(first)
+            |SELECT word, length, cast(first as string) as first FROM tab1
+          """.stripMargin)
+
+        checkAnswer(spark.table("tab2"), Row("a", 3, "b"))
+      }
+    }
+  }
+
+  Seq("LOCAL", "").foreach { local =>
+    Seq(true, false).foreach { caseSensitivity =>
+      Seq("orc", "parquet").foreach { format =>
+        test(s"SPARK-25389 INSERT OVERWRITE $local DIRECTORY ... STORED AS with duplicated names" +
+          s"(caseSensitivity=$caseSensitivity, format=$format)") {
+          withTempDir { dir =>
+            withSQLConf(SQLConf.CASE_SENSITIVE.key -> s"$caseSensitivity") {
+              val m = intercept[AnalysisException] {
+                sql(
+                  s"""
+                     |INSERT OVERWRITE $local DIRECTORY '${dir.toURI}'
+                     |STORED AS $format
+                     |SELECT 'id', 'id2' ${if (caseSensitivity) "id" else "ID"}
+                   """.stripMargin)
+              }.getMessage
+              assert(m.contains("Found duplicate column(s) when inserting into"))
+            }
+          }
+        }
+      }
     }
   }
 }

@@ -503,18 +503,24 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       val join = right.optionalMap(left)(Join(_, _, Inner, None))
       withJoinRelations(join, relation)
     }
-    ctx.lateralView.asScala.foldLeft(from)(withGenerate)
+    if (ctx.pivotClause() != null) {
+      if (!ctx.lateralView.isEmpty) {
+        throw new ParseException("LATERAL cannot be used together with PIVOT in FROM clause", ctx)
+      }
+      withPivot(ctx.pivotClause, from)
+    } else {
+      ctx.lateralView.asScala.foldLeft(from)(withGenerate)
+    }
   }
 
   /**
    * Connect two queries by a Set operator.
    *
    * Supported Set operators are:
-   * - UNION [DISTINCT]
-   * - UNION ALL
-   * - EXCEPT [DISTINCT]
-   * - MINUS [DISTINCT]
-   * - INTERSECT [DISTINCT]
+   * - UNION [ DISTINCT | ALL ]
+   * - EXCEPT [ DISTINCT | ALL ]
+   * - MINUS [ DISTINCT | ALL ]
+   * - INTERSECT [DISTINCT | ALL]
    */
   override def visitSetOperation(ctx: SetOperationContext): LogicalPlan = withOrigin(ctx) {
     val left = plan(ctx.left)
@@ -526,17 +532,17 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       case SqlBaseParser.UNION =>
         Distinct(Union(left, right))
       case SqlBaseParser.INTERSECT if all =>
-        throw new ParseException("INTERSECT ALL is not supported.", ctx)
+        Intersect(left, right, isAll = true)
       case SqlBaseParser.INTERSECT =>
-        Intersect(left, right)
+        Intersect(left, right, isAll = false)
       case SqlBaseParser.EXCEPT if all =>
-        throw new ParseException("EXCEPT ALL is not supported.", ctx)
+        Except(left, right, isAll = true)
       case SqlBaseParser.EXCEPT =>
-        Except(left, right)
+        Except(left, right, isAll = false)
       case SqlBaseParser.SETMINUS if all =>
-        throw new ParseException("MINUS ALL is not supported.", ctx)
+        Except(left, right, isAll = true)
       case SqlBaseParser.SETMINUS =>
-        Except(left, right)
+        Except(left, right, isAll = false)
     }
   }
 
@@ -615,6 +621,38 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
   }
 
   /**
+   * Add a [[Pivot]] to a logical plan.
+   */
+  private def withPivot(
+      ctx: PivotClauseContext,
+      query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+    val aggregates = Option(ctx.aggregates).toSeq
+      .flatMap(_.namedExpression.asScala)
+      .map(typedVisit[Expression])
+    val pivotColumn = if (ctx.pivotColumn.identifiers.size == 1) {
+      UnresolvedAttribute.quoted(ctx.pivotColumn.identifier.getText)
+    } else {
+      CreateStruct(
+        ctx.pivotColumn.identifiers.asScala.map(
+          identifier => UnresolvedAttribute.quoted(identifier.getText)))
+    }
+    val pivotValues = ctx.pivotValues.asScala.map(visitPivotValue)
+    Pivot(None, pivotColumn, pivotValues, aggregates, query)
+  }
+
+  /**
+   * Create a Pivot column value with or without an alias.
+   */
+  override def visitPivotValue(ctx: PivotValueContext): Expression = withOrigin(ctx) {
+    val e = expression(ctx.expression)
+    if (ctx.identifier != null) {
+      Alias(e, ctx.identifier.getText)()
+    } else {
+      e
+    }
+  }
+
+  /**
    * Add a [[Generate]] (Lateral View) to a logical plan.
    */
   private def withGenerate(
@@ -623,9 +661,11 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
     val expressions = expressionList(ctx.expression)
     Generate(
       UnresolvedGenerator(visitFunctionName(ctx.qualifiedName), expressions),
-      join = true,
+      unrequiredChildIndex = Nil,
       outer = ctx.OUTER != null,
+      // scalastyle:off caselocale
       Some(ctx.tblName.getText.toLowerCase),
+      // scalastyle:on caselocale
       ctx.colName.asScala.map(_.getText).map(UnresolvedAttribute.apply),
       query)
   }
@@ -661,7 +701,7 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
         // Resolve the join type and join condition
         val (joinType, condition) = Option(join.joinCriteria) match {
           case Some(c) if c.USING != null =>
-            (UsingJoin(baseJoinType, c.identifier.asScala.map(_.getText)), None)
+            (UsingJoin(baseJoinType, visitIdentifierList(c.identifierList)), None)
           case Some(c) if c.booleanExpression != null =>
             (baseJoinType, Option(expression(c.booleanExpression)))
           case None if join.NATURAL != null =>
@@ -699,20 +739,30 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       Sample(0.0, fraction, withReplacement = false, (math.random * 1000).toInt, query)
     }
 
-    ctx.sampleType.getType match {
-      case SqlBaseParser.ROWS =>
+    if (ctx.sampleMethod() == null) {
+      throw new ParseException("TABLESAMPLE does not accept empty inputs.", ctx)
+    }
+
+    ctx.sampleMethod() match {
+      case ctx: SampleByRowsContext =>
         Limit(expression(ctx.expression), query)
 
-      case SqlBaseParser.PERCENTLIT =>
+      case ctx: SampleByPercentileContext =>
         val fraction = ctx.percentage.getText.toDouble
         val sign = if (ctx.negativeSign == null) 1 else -1
         sample(sign * fraction / 100.0d)
 
-      case SqlBaseParser.BYTELENGTH_LITERAL =>
-        throw new ParseException(
-          "TABLESAMPLE(byteLengthLiteral) is not supported", ctx)
+      case ctx: SampleByBytesContext =>
+        val bytesStr = ctx.bytes.getText
+        if (bytesStr.matches("[0-9]+[bBkKmMgG]")) {
+          throw new ParseException("TABLESAMPLE(byteLengthLiteral) is not supported", ctx)
+        } else {
+          throw new ParseException(
+            bytesStr + " is not a valid byte length literal, " +
+              "expected syntax: DIGIT+ ('B' | 'K' | 'M' | 'G')", ctx)
+        }
 
-      case SqlBaseParser.BUCKET if ctx.ON != null =>
+      case ctx: SampleByBucketContext if ctx.ON() != null =>
         if (ctx.identifier != null) {
           throw new ParseException(
             "TABLESAMPLE(BUCKET x OUT OF y ON colname) is not supported", ctx)
@@ -721,7 +771,7 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
             "TABLESAMPLE(BUCKET x OUT OF y ON function) is not supported", ctx)
         }
 
-      case SqlBaseParser.BUCKET =>
+      case ctx: SampleByBucketContext =>
         sample(ctx.numerator.getText.toDouble / ctx.denominator.getText.toDouble)
     }
   }
@@ -1055,6 +1105,11 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       case not => Not(e)
     }
 
+    def getValueExpressions(e: Expression): Seq[Expression] = e match {
+      case c: CreateNamedStruct => c.valExprs
+      case other => Seq(other)
+    }
+
     // Create the predicate.
     ctx.kind.getType match {
       case SqlBaseParser.BETWEEN =>
@@ -1063,7 +1118,7 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
           GreaterThanOrEqual(e, expression(ctx.lower)),
           LessThanOrEqual(e, expression(ctx.upper))))
       case SqlBaseParser.IN if ctx.query != null =>
-        invertIfNotDefined(In(e, Seq(ListQuery(plan(ctx.query)))))
+        invertIfNotDefined(InSubquery(getValueExpressions(e), ListQuery(plan(ctx.query))))
       case SqlBaseParser.IN =>
         invertIfNotDefined(In(e, ctx.expression.asScala.map(expression)))
       case SqlBaseParser.LIKE =>
@@ -1104,7 +1159,7 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       case SqlBaseParser.PERCENT =>
         Remainder(left, right)
       case SqlBaseParser.DIV =>
-        Cast(Divide(left, right), LongType)
+        IntegralDivide(left, right)
       case SqlBaseParser.PLUS =>
         Add(left, right)
       case SqlBaseParser.MINUS =>
@@ -1176,9 +1231,57 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
   }
 
   /**
+   * Create a Extract expression.
+   */
+  override def visitExtract(ctx: ExtractContext): Expression = withOrigin(ctx) {
+    ctx.field.getText.toUpperCase(Locale.ROOT) match {
+      case "YEAR" =>
+        Year(expression(ctx.source))
+      case "QUARTER" =>
+        Quarter(expression(ctx.source))
+      case "MONTH" =>
+        Month(expression(ctx.source))
+      case "WEEK" =>
+        WeekOfYear(expression(ctx.source))
+      case "DAY" =>
+        DayOfMonth(expression(ctx.source))
+      case "DAYOFWEEK" =>
+        DayOfWeek(expression(ctx.source))
+      case "HOUR" =>
+        Hour(expression(ctx.source))
+      case "MINUTE" =>
+        Minute(expression(ctx.source))
+      case "SECOND" =>
+        Second(expression(ctx.source))
+      case other =>
+        throw new ParseException(s"Literals of type '$other' are currently not supported.", ctx)
+    }
+  }
+
+  /**
    * Create a (windowed) Function expression.
    */
   override def visitFunctionCall(ctx: FunctionCallContext): Expression = withOrigin(ctx) {
+    def replaceFunctions(
+        funcID: FunctionIdentifier,
+        ctx: FunctionCallContext): FunctionIdentifier = {
+      val opt = ctx.trimOption
+      if (opt != null) {
+        if (ctx.qualifiedName.getText.toLowerCase(Locale.ROOT) != "trim") {
+          throw new ParseException(s"The specified function ${ctx.qualifiedName.getText} " +
+            s"doesn't support with option ${opt.getText}.", ctx)
+        }
+        opt.getType match {
+          case SqlBaseParser.BOTH => funcID
+          case SqlBaseParser.LEADING => funcID.copy(funcName = "ltrim")
+          case SqlBaseParser.TRAILING => funcID.copy(funcName = "rtrim")
+          case _ => throw new ParseException("Function trim doesn't support with " +
+            s"type ${opt.getType}. Please use BOTH, LEADING or Trailing as trim type", ctx)
+        }
+      } else {
+        funcID
+      }
+    }
     // Create the function call.
     val name = ctx.qualifiedName.getText
     val isDistinct = Option(ctx.setQuantifier()).exists(_.DISTINCT != null)
@@ -1190,7 +1293,9 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       case expressions =>
         expressions
     }
-    val function = UnresolvedFunction(visitFunctionName(ctx.qualifiedName), arguments, isDistinct)
+    val funcId = replaceFunctions(visitFunctionName(ctx.qualifiedName), ctx)
+    val function = UnresolvedFunction(funcId, arguments, isDistinct)
+
 
     // Check if the function is evaluated in a windowed context.
     ctx.windowSpec match {
@@ -1203,19 +1308,6 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
   }
 
   /**
-   * Create a current timestamp/date expression. These are different from regular function because
-   * they do not require the user to specify braces when calling them.
-   */
-  override def visitTimeFunctionCall(ctx: TimeFunctionCallContext): Expression = withOrigin(ctx) {
-    ctx.name.getType match {
-      case SqlBaseParser.CURRENT_DATE =>
-        CurrentDate()
-      case SqlBaseParser.CURRENT_TIMESTAMP =>
-        CurrentTimestamp()
-    }
-  }
-
-  /**
    * Create a function database (optional) and name pair.
    */
   protected def visitFunctionName(ctx: QualifiedNameContext): FunctionIdentifier = {
@@ -1224,6 +1316,16 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       case Seq(fn) => FunctionIdentifier(fn, None)
       case other => throw new ParseException(s"Unsupported function name '${ctx.getText}'", ctx)
     }
+  }
+
+  /**
+   * Create an [[LambdaFunction]].
+   */
+  override def visitLambda(ctx: LambdaContext): Expression = withOrigin(ctx) {
+    val arguments = ctx.IDENTIFIER().asScala.map { name =>
+      UnresolvedAttribute.quoted(name.getText)
+    }
+    LambdaFunction(expression(ctx.expression), arguments)
   }
 
   /**
@@ -1439,7 +1541,7 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
         case "TIMESTAMP" =>
           Literal(Timestamp.valueOf(value))
         case "X" =>
-          val padding = if (value.length % 2 == 1) "0" else ""
+          val padding = if (value.length % 2 != 0) "0" else ""
           Literal(DatatypeConverter.parseHexBinary(padding + value))
         case other =>
           throw new ParseException(s"Literals of type '$other' are currently not supported.", ctx)

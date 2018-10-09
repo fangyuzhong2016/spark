@@ -89,6 +89,16 @@ object SubqueryExpression {
       case _ => false
     }.isDefined
   }
+
+  /**
+   * Returns true when an expression contains a subquery
+   */
+  def hasSubquery(e: Expression): Boolean = {
+    e.find {
+      case _: SubqueryExpression => true
+      case _ => false
+    }.isDefined
+  }
 }
 
 object SubExprUtils extends PredicateHelper {
@@ -107,10 +117,10 @@ object SubExprUtils extends PredicateHelper {
   def hasNullAwarePredicateWithinNot(condition: Expression): Boolean = {
     splitConjunctivePredicates(condition).exists {
       case _: Exists | Not(_: Exists) => false
-      case In(_, Seq(_: ListQuery)) | Not(In(_, Seq(_: ListQuery))) => false
+      case _: InSubquery | Not(_: InSubquery) => false
       case e => e.find { x =>
         x.isInstanceOf[Not] && e.find {
-          case In(_, Seq(_: ListQuery)) => true
+          case _: InSubquery => true
           case _ => false
         }.isDefined
       }.isDefined
